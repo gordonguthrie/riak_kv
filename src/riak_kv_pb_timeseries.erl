@@ -74,7 +74,7 @@
 -type ts_responses() :: #tsputresp{} |
                         #tsdelresp{} | #tsgetresp{} | #tslistkeysresp{} | #tsqueryresp{} |
                         #rpberrorresp{}.
--type ts_query_types() :: #ddl_v1{} | ?SQL_SELECT{} | #riak_sql_describe_v1{}.
+-type ts_query_types() :: ?DDL{} | ?SQL_SELECT{} | #riak_sql_describe_v1{}.
 
 -type process_retval() :: {reply, RpbOrTsMessage::tuple(), #state{}}.
 
@@ -344,7 +344,7 @@ put_data(Data, Table, Mod) when is_binary(Table) ->
 -spec partition_data(Data :: list(term()),
                      Bucket :: {binary(), binary()},
                      BucketProps :: proplists:proplist(),
-                     DDL :: #ddl_v1{},
+                     DDL :: ?DDL{},
                      Mod :: module()) ->
                             list(tuple(chash:index(), list(term()))).
 partition_data(Data, Bucket, BucketProps, DDL, Mod) ->
@@ -490,7 +490,7 @@ sub_tslistkeysreq(Mod, DDL, #tslistkeysreq{table = Table,
         {ok, ReqId} ->
             ColumnInfo =
                 [Mod:get_field_type(N)
-                 || #param_v1{name = N} <- DDL#ddl_v1.local_key#key_v1.ast],
+                 || #param_v1{name = N} <- DDL?DDL.local_key#key_v1.ast],
             {reply, {stream, ReqId}, State#state{req = Req, req_ctx = ReqId,
                                                  column_info = ColumnInfo}};
         {error, Reason} ->
@@ -684,7 +684,7 @@ sub_tsqueryreq(_Mod, DDL, SQL, State) ->
 %% ---------------------------------------------------
 
 -spec check_table_and_call(Table::binary(),
-                           WorkItem::fun((module(), #ddl_v1{},
+                           WorkItem::fun((module(), ?DDL{},
                                           OrigMessage::tuple(), #state{}) ->
                                                 process_retval()),
                            OrigMessage::tuple(),
@@ -862,7 +862,7 @@ missing_helper_module_not_ts_type_test() ->
 missing_helper_module_test() ->
     ?assertMatch(
         #rpberrorresp{errcode = ?E_MISSING_TS_MODULE },
-        missing_helper_module(<<"mytype">>, [{ddl, #ddl_v1{}}])
+        missing_helper_module(<<"mytype">>, [{ddl, ?DDL{}}])
     ).
 
 test_helper_validate_rows_mod() ->
