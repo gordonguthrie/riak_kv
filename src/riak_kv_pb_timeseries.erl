@@ -267,19 +267,37 @@ wait_until_active(Table, State, Seconds) ->
 %%
 -spec make_insert_response(module(), #riak_sql_insert_v1{}) ->
                            #tsqueryresp{} | #rpberrorresp{}.
-make_insert_response(Mod, #riak_sql_insert_v1{'INSERT' = Table, fields = Fields, values = Values}) ->
+make_insert_response(Mod, #riak_sql_insert_v1{'INSERT' = Table,
+                                              fields = Fields, values = Values}) ->
     case lookup_field_positions(Mod, Fields) of
-    {ok, Positions} ->
-        Empty = make_empty_row(Mod),
-        case xlate_insert_to_putdata(Values, Positions, Empty) of
-            {error, ValueReason} ->
-                make_rpberrresp(?E_BAD_QUERY, ValueReason);
-            {ok, Data} ->
-                insert_putreqs(Mod, Table, Data)
-	    end;
-    {error, FieldReason} ->
-        make_rpberrresp(?E_BAD_QUERY, FieldReason)
+        {ok, Positions} ->
+            case ensure_value_record_sizes(Values, length(Fields)) of
+                {ok, RecordsOfMatchingSize} ->
+                    Empty = make_empty_row(Mod),
+                    Data = xlate_insert_to_putdata(RecordsOfMatchingSize, Positions, Empty),
+                    insert_putreqs(Mod, Table, Data);
+                {error, Reason} ->
+                    make_rpberrresp(?E_BAD_QUERY, Reason)
+            end;
+        {error, FieldReason} ->
+            make_rpberrresp(?E_BAD_QUERY, FieldReason)
     end.
+
+ensure_value_record_sizes(RR, N) ->
+    ensure_value_record_sizes_(RR, N, []).
+ensure_value_record_sizes_([], _N, Acc) ->
+    {ok, lists:reverse(Acc)};
+ensure_value_record_sizes_([R|RR], N, Acc)
+  when length(R) == N ->
+    ensure_value_record_sizes_(RR, N, [R|Acc]);
+ensure_value_record_sizes_([R|RR], N, Acc)
+  when length(R) < N ->
+    Rfixed = R ++ lists:duplicate(N - length(R), undefined),
+    ensure_value_record_sizes_(RR, N, [Rfixed|Acc]);
+ensure_value_record_sizes_([R|_], N, Acc) ->
+    {error, flat_format(
+              "Too many values in INSERT statement (~b, expecting at most ~b, at record ~b)",
+              [length(R), N, length(Acc) + 1])}.
 
 insert_putreqs(Mod, Table, Data) ->
     case catch validate_rows(Mod, Data) of
@@ -297,7 +315,7 @@ insert_putreqs(Mod, Table, Data) ->
 %%
 %% Return an all-null empty row ready to be populated by the values
 %%
--spec make_empty_row(module()) -> tuple(undefined).
+-spec make_empty_row(module()) -> tuple().
 make_empty_row(Mod) ->
     Positions = Mod:get_field_positions(),
     list_to_tuple(lists:duplicate(length(Positions), undefined)).
@@ -311,16 +329,16 @@ make_empty_row(Mod) ->
                            {ok, [pos_integer()]} | {error, string()}.
 lookup_field_positions(Mod, FieldIdentifiers) ->
     case lists:foldl(
-	   fun({identifier, FieldName}, {Good, Bad}) ->
-		   case Mod:is_field_valid(FieldName) of
-               false ->
-                   {Good, [FieldName | Bad]};
-               true ->
-                   {[Mod:get_field_position(FieldName) | Good], Bad}
-		   end
-	   end, {[], []}, FieldIdentifiers)
+           fun({identifier, FieldName}, {Good, Bad}) ->
+                   case Mod:is_field_valid(FieldName) of
+                       false ->
+                           {Good, [FieldName | Bad]};
+                       true ->
+                           {[Mod:get_field_position(FieldName) | Good], Bad}
+                   end
+           end, {[], []}, FieldIdentifiers)
     of
-        {Positions, []} ->
+        {Positions, []} when length(Positions) > 0 ->
             {ok, lists:reverse(Positions)};
         {_, Errors} ->
             {error, flat_format("undefined fields: ~s",
@@ -333,38 +351,21 @@ lookup_field_positions(Mod, FieldIdentifiers) ->
 %% and the general validation rules should pick that up.
 %% If there are too many values given for the fields it returns an error.
 %%
--spec xlate_insert_to_putdata([[riak_ql_ddl:data_value()]], [pos_integer()], tuple(undefined)) ->
-                              {ok, [tuple()]} | {error, string()}.
+-spec xlate_insert_to_putdata([[riak_ql_ddl:data_value()]], [pos_integer()], tuple()) ->
+                              [tuple()].
 xlate_insert_to_putdata(Values, Positions, Empty) ->
-    ConvFn = fun(RowVals, {Good, Bad, RowNum}) ->
-                 case make_insert_row(RowVals, Positions, Empty) of
-                     {ok, Row} ->
-                         {[Row | Good], Bad, RowNum + 1};
-                     {error, _Reason} ->
-                         {Good, [integer_to_list(RowNum) | Bad], RowNum + 1}
-                 end
-             end,
-    Converted = lists:foldl(ConvFn, {[], [], 1}, Values),
-    case Converted of
-        {PutData, [], _} ->
-            {ok, lists:reverse(PutData)};
-        {_, Errors, _} ->
-            {error, flat_format("too many values in row index(es) ~s",
-                                [string:join(lists:reverse(Errors), ", ")])}
-    end.
+    [make_insert_row(
+       lists:zip(RowVals, Positions), Empty) || RowVals <- Values].
 
--spec make_insert_row([] | [riak_ql_ddl:data_value()], [] | [pos_integer()], tuple()) ->
-                      {ok, tuple()} | {error, string()}.
-make_insert_row([], _Positions, Row) when is_tuple(Row) ->
+-spec make_insert_row([{riak_ql_ddl:data_value(), pos_integer()}], tuple()) ->
+                      tuple().
+%% Make sure the types match
+make_insert_row([{{_Type, Val}, Pos} | Rest], Row) ->
+    make_insert_row(Rest, setelement(Pos, Row, Val));
+make_insert_row([], Row) ->
     %% Out of entries in the value - row is populated with default values
     %% so if we run out of data for implicit/explicit fieldnames can just return
-    {ok, Row};
-make_insert_row(_, [], Row) when is_tuple(Row) ->
-    %% Too many values for the field
-    {error, "too many values"};
-%% Make sure the types match
-make_insert_row([{_Type, Val} | Values], [Pos | Positions], Row) when is_tuple(Row) ->
-    make_insert_row(Values, Positions, setelement(Pos, Row, Val)).
+    Row.
 
 
 %% -----------
@@ -1042,19 +1043,9 @@ validate_make_insert_row_basic_test() ->
     Data = [{integer,4}, {binary,<<"bamboozle">>}, {float, 3.14}],
     Positions = [3, 1, 2],
     Row = {undefined, undefined, undefined},
-    Result = make_insert_row(Data, Positions, Row),
+    Result = make_insert_row(lists:zip(Data, Positions), Row),
     ?assertEqual(
-        {ok, {<<"bamboozle">>, 3.14, 4}},
-        Result
-    ).
-
-validate_make_insert_row_too_many_test() ->
-    Data = [{integer,4}, {binary,<<"bamboozle">>}, {float, 3.14}, {integer, 8}],
-    Positions = [3, 1, 2],
-    Row = {undefined, undefined, undefined},
-    Result = make_insert_row(Data, Positions, Row),
-    ?assertEqual(
-        {error, "too many values"},
+        {<<"bamboozle">>, 3.14, 4},
         Result
     ).
 
@@ -1063,22 +1054,11 @@ validate_xlate_insert_to_putdata_ok_test() ->
     Empty = list_to_tuple(lists:duplicate(5, undefined)),
     Values = [[{integer, 4}, {binary, <<"babs">>}, {float, 5.67}, {binary, <<"bingo">>}],
               [{integer, 8}, {binary, <<"scat">>}, {float, 7.65}, {binary, <<"yolo!">>}]],
-    Positions = [5, 3, 1, 2, 4],
+    Positions = [5, 3, 1, 2],
     Result = xlate_insert_to_putdata(Values, Positions, Empty),
     ?assertEqual(
-        {ok,[{5.67,<<"bingo">>,<<"babs">>,undefined,4},
-             {7.65,<<"yolo!">>,<<"scat">>,undefined,8}]},
-        Result
-    ).
-
-validate_xlate_insert_to_putdata_too_many_values_test() ->
-    Empty = list_to_tuple(lists:duplicate(5, undefined)),
-    Values = [[{integer, 4}, {binary, <<"babs">>}, {float, 5.67}, {binary, <<"bingo">>}, {integer, 7}],
-           [{integer, 8}, {binary, <<"scat">>}, {float, 7.65}, {binary, <<"yolo!">>}]],
-    Positions = [3, 1, 2, 4],
-    Result = xlate_insert_to_putdata(Values, Positions, Empty),
-    ?assertEqual(
-        {error,"too many values in row index(es) 1"},
+        [{5.67,<<"bingo">>,<<"babs">>,undefined,4},
+         {7.65,<<"yolo!">>,<<"scat">>,undefined,8}],
         Result
     ).
 
